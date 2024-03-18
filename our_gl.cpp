@@ -1,55 +1,82 @@
+#include <cmath>
+#include <limits>
+#include <cstdlib>
 #include "our_gl.h"
 
-mat<4,4> ModelView;
-mat<4,4> Viewport;
-mat<4,4> Projection;
+Matrix ModelView;
+Matrix Viewport;
+Matrix Projection;
 
-void viewport(const int x, const int y, const int w, const int h) {
-    Viewport = {{{w/2., 0, 0, x+w/2.}, {0, h/2., 0, y+h/2.}, {0,0,1,0}, {0,0,0,1}}};
+IShader::~IShader() {}
+
+void viewport(int x, int y, int w, int h) {
+    Viewport = Matrix::identity();
+    Viewport[0][3] = x+w/2.f;
+    Viewport[1][3] = y+h/2.f;
+    Viewport[2][3] = 255.f/2.f;
+    Viewport[0][0] = w/2.f;
+    Viewport[1][1] = h/2.f;
+    Viewport[2][2] = 255.f/2.f;
+}
+//"Viewport[0][3]" 和 "Viewport[1][3]" 是将原点（中心点）平移到视口的中心点，即 x + w/2 和 y + h/2。
+//"Viewport[2][3]" 将z坐标平移至255/2的位置，使得Z可以在0到255的范围内变换。
+//"Viewport[0][0]" 和 "Viewport[1][1]" 的作用是将宽度和高度分别缩放至视口的宽度和高度的一半，保证了点会出现在正确的位置。
+//"Viewport[2][2]" 将Z轴坐标压缩到了0到255的范围。
+
+void projection(float coeff) {
+    Projection = Matrix::identity();
+    Projection[3][2] = coeff;
+}
+//然后，根据摄像机坐标系的三个轴，构造了一个模型视图矩阵"ModelView"。这个矩阵的前三列是x、y和z轴，它们定义了新的坐标轴。矩阵的最后一列则是-center，它定义了新的原点。
+void lookat(Vec3f eye, Vec3f center, Vec3f up) {
+    Vec3f z = (eye-center).normalize();
+    Vec3f x = cross(up,z).normalize();
+    Vec3f y = cross(z,x).normalize();
+    ModelView = Matrix::identity();//初始化
+    for (int i=0; i<3; i++) {
+        ModelView[0][i] = x[i];
+        ModelView[1][i] = y[i];
+        ModelView[2][i] = z[i];
+        ModelView[i][3] = -center[i];
+    }
 }
 
-void projection(const double f) { // check https://en.wikipedia.org/wiki/Camera_matrix
-    Projection = {{{1,0,0,0}, {0,-1,0,0}, {0,0,1,0}, {0,0,-1/f,0}}};
+Vec3f barycentric(Vec2f A, Vec2f B, Vec2f C, Vec2f P) {
+    Vec3f s[2];
+    for (int i=2; i--; ) {
+        s[i][0] = C[i]-A[i];
+        s[i][1] = B[i]-A[i];
+        s[i][2] = A[i]-P[i];
+    }
+    Vec3f u = cross(s[0], s[1]);
+    if (std::abs(u[2])>1e-2) // dont forget that u[2] is integer. If it is zero then triangle ABC is degenerate
+        return Vec3f(1.f-(u.x+u.y)/u.z, u.y/u.z, u.x/u.z);
+    return Vec3f(-1,1,1); // in this case generate negative coordinates, it will be thrown away by the rasterizator
 }
 
-void lookat(const vec3 eye, const vec3 center, const vec3 up) {
-    vec3 z = (center-eye).normalized();
-    vec3 x =  cross(up,z).normalized();
-    vec3 y =  cross(z, x).normalized();
-    mat<4,4> Minv = {{{x.x,x.y,x.z,0},   {y.x,y.y,y.z,0},   {z.x,z.y,z.z,0},   {0,0,0,1}}};
-    mat<4,4> Tr   = {{{1,0,0,-eye.x}, {0,1,0,-eye.y}, {0,0,1,-eye.z}, {0,0,0,1}}};
-    ModelView = Minv*Tr;
-}
-
-vec3 barycentric(const vec2 tri[3], const vec2 P) {
-    mat<3,3> ABC = {{embed<3>(tri[0]), embed<3>(tri[1]), embed<3>(tri[2])}};
-    if (ABC.det()<1e-3) return {-1,1,1}; // for a degenerate triangle generate negative coordinates, it will be thrown away by the rasterizator
-    return ABC.invert_transpose() * embed<3>(P);
-}
-
-void triangle(const vec4 clip_verts[3], IShader &shader, TGAImage &image, std::vector<double> &zbuffer) {
-    vec4 pts[3]  = { Viewport*clip_verts[0],    Viewport*clip_verts[1],    Viewport*clip_verts[2]    };  // triangle screen coordinates before persp. division
-    vec2 pts2[3] = { proj<2>(pts[0]/pts[0][3]), proj<2>(pts[1]/pts[1][3]), proj<2>(pts[2]/pts[2][3]) };  // triangle screen coordinates after  perps. division
-
-    int bboxmin[2] = {image.width()-1, image.height()-1};
-    int bboxmax[2] = {0, 0};
-    for (int i=0; i<3; i++)
+void triangle(Vec4f *pts, IShader &shader, TGAImage &image, TGAImage &zbuffer) {
+    Vec2f bboxmin( std::numeric_limits<float>::max(),  std::numeric_limits<float>::max());
+    Vec2f bboxmax(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
+    for (int i=0; i<3; i++) {
         for (int j=0; j<2; j++) {
-            bboxmin[j] = std::min(bboxmin[j], static_cast<int>(pts2[i][j]));
-            bboxmax[j] = std::max(bboxmax[j], static_cast<int>(pts2[i][j]));
+            bboxmin[j] = std::min(bboxmin[j], pts[i][j]/pts[i][3]);
+            bboxmax[j] = std::max(bboxmax[j], pts[i][j]/pts[i][3]);
         }
-#pragma omp parallel for
-    for (int x=std::max(bboxmin[0], 0); x<=std::min(bboxmax[0], image.width()-1); x++) {
-        for (int y=std::max(bboxmin[1], 0); y<=std::min(bboxmax[1], image.height()-1); y++) {
-            vec3 bc_screen = barycentric(pts2, {static_cast<double>(x), static_cast<double>(y)});
-            vec3 bc_clip   = {bc_screen.x/pts[0][3], bc_screen.y/pts[1][3], bc_screen.z/pts[2][3]};
-            bc_clip = bc_clip/(bc_clip.x+bc_clip.y+bc_clip.z); 
-            double frag_depth = vec3{clip_verts[0][2], clip_verts[1][2], clip_verts[2][2]}*bc_clip;
-            if (bc_screen.x<0 || bc_screen.y<0 || bc_screen.z<0 || frag_depth > zbuffer[x+y*image.width()]) continue;
-            TGAColor color;
-            if (shader.fragment(bc_clip, color)) continue; // fragment shader can discard current fragment
-            zbuffer[x+y*image.width()] = frag_depth;
-            image.set(x, y, color);
+    }
+    Vec2i P;
+    TGAColor color;
+    for (P.x=bboxmin.x; P.x<=bboxmax.x; P.x++) {
+        for (P.y=bboxmin.y; P.y<=bboxmax.y; P.y++) {
+            Vec3f c = barycentric(proj<2>(pts[0]/pts[0][3]), proj<2>(pts[1]/pts[1][3]), proj<2>(pts[2]/pts[2][3]), proj<2>(P));
+            float z = pts[0][2]*c.x + pts[1][2]*c.y + pts[2][2]*c.z;
+            float w = pts[0][3]*c.x + pts[1][3]*c.y + pts[2][3]*c.z;
+            int frag_depth = std::max(0, std::min(255, int(z/w+.5)));
+            if (c.x<0 || c.y<0 || c.z<0 || zbuffer.get(P.x, P.y)[0]>frag_depth) continue;
+            bool discard = shader.fragment(c, color);
+            if (!discard) {
+                zbuffer.set(P.x, P.y, TGAColor(frag_depth));
+                image.set(P.x, P.y, color);
+            }
         }
     }
 }
